@@ -38,6 +38,8 @@ class TTSContext(HandlerContext):
         self.dump_audio = False
         self.audio_dump_file = None
         self.synthesizer = None
+        self.shared_states = None
+        self.active_speech_id = None
 
 
 class HandlerTTS(HandlerBase, ABC):
@@ -93,6 +95,7 @@ class HandlerTTS(HandlerBase, ABC):
         if not isinstance(handler_config, TTSConfig):
             handler_config = TTSConfig()
         context = TTSContext(session_context.session_info.session_id)
+        context.shared_states = session_context.shared_states
         context.input_text = ''
         if context.dump_audio:
             dump_file_path = os.path.join(DirectoryInfo.get_project_dir(), 'temp',
@@ -112,6 +115,10 @@ class HandlerTTS(HandlerBase, ABC):
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         output_definition = output_definitions.get(ChatDataType.AVATAR_AUDIO).definition
         context = cast(TTSContext, context)
+        if context.shared_states is not None and context.shared_states.interrupting:
+            self._stop_stream(context)
+            context.shared_states.interrupting = False
+            context.active_speech_id = None
         if inputs.type == ChatDataType.AVATAR_TEXT:
             text = inputs.data.get_main_data()
         else:
@@ -119,6 +126,9 @@ class HandlerTTS(HandlerBase, ABC):
         speech_id = inputs.data.get_meta("speech_id")
         if (speech_id is None):
             speech_id = context.session_id
+        context.active_speech_id = speech_id
+        if context.shared_states is not None:
+            context.shared_states.current_speech_id = speech_id
 
         if text is not None:
             text = re.sub(r"<\|.*?\|>", "", text)
@@ -141,7 +151,15 @@ class HandlerTTS(HandlerBase, ABC):
                 context.input_text = ''
         except Exception as e:
             logger.error(e)
-            context.synthesizer.streaming_complete()
+            self._stop_stream(context)
+
+    @staticmethod
+    def _stop_stream(context: TTSContext):
+        if context.synthesizer is not None:
+            try:
+                context.synthesizer.streaming_complete()
+            except Exception as e:
+                logger.opt(exception=True).error(e)
             context.synthesizer = None
 
     def destroy_context(self, context: HandlerContext):
@@ -157,6 +175,15 @@ class CosyvoiceCallBack(ResultCallback):
         self.speech_id = speech_id
         self.temp_bytes = b''
 
+    def _should_drop(self) -> bool:
+        if self.context.shared_states is None:
+            return False
+        if self.context.shared_states.interrupting:
+            return True
+        if self.context.active_speech_id and self.context.active_speech_id != self.speech_id:
+            return True
+        return False
+
     def on_open(self) -> None:
         logger.info('连接成功')
 
@@ -166,6 +193,8 @@ class CosyvoiceCallBack(ResultCallback):
         pass
 
     def on_data(self, data: bytes) -> None:
+        if self._should_drop():
+            return
         self.temp_bytes += data
         if len(self.temp_bytes) > 24000:
             # 实现接收合成二进制音频结果的逻辑
@@ -180,6 +209,9 @@ class CosyvoiceCallBack(ResultCallback):
             self.temp_bytes = b''
 
     def on_complete(self) -> None:
+        if self._should_drop():
+            self.temp_bytes = b''
+            return
         if len(self.temp_bytes) > 0:
             output_audio = np.array(np.frombuffer(self.temp_bytes, dtype=np.int16)).astype(np.float32)/32767
             output_audio = output_audio[np.newaxis, ...]

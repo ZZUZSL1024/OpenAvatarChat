@@ -236,6 +236,7 @@ from chat_engine.data_models.chat_data.chat_data_model import ChatData  # noqa: 
 from chat_engine.data_models.chat_data_type import ChatDataType  # noqa: E402
 from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel  # noqa: E402
 from chat_engine.data_models.chat_signal import ChatSignal  # noqa: E402
+from chat_engine.data_models.chat_signal_type import ChatSignalType  # noqa: E402
 from chat_engine.data_models.runtime_data.data_bundle import (  # noqa: E402
     DataBundleDefinition, DataBundleEntry, VariableSize, DataBundle  # noqa: E402
 )  # noqa: E402
@@ -308,7 +309,12 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
         return self.timestamp_generator()
 
     def emit_signal(self, signal: ChatSignal):
-        pass
+        # Forward client side control signals into the chat session.
+        if hasattr(self, "chat_session") and self.chat_session is not None:
+            self.chat_session.emit_signal(signal)
+        if self.shared_states is not None and signal.type == ChatSignalType.INTERRUPT:
+            # Also clear local caches to drop stale outputs quickly.
+            self.clear_data()
 
     def clear_data(self):
         for data_queue in self.output_queues.values():
