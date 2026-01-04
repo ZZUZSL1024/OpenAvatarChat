@@ -122,6 +122,12 @@ class AvatarMuseTalkProcessor:
             logger.opt(exception=True).error(f"Exception during thread join: {e}")
         logger.info(f"MuseProcessor stopped.")
 
+    def interrupt(self):
+        """Clear internal queues to drop ongoing speech synthesis output."""
+        self._clear_queues()
+        self._callback_avatar_status = AvatarStatus.LISTENING
+        self._last_speech_id = None
+
     def add_audio(self, speech_audio: SpeechAudio):
         """
         Add an audio segment to the processing queue. The segment length must not exceed 1 second. No resampling is performed here.

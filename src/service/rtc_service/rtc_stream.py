@@ -166,6 +166,20 @@ class RtcStream(AsyncAudioVideoStreamHandler):
         if timestamp[0] / timestamp[1] < self.stream_start_delay:
             return
         _, array = frame
+        # If the avatar is speaking and the user starts talking again, trigger an interrupt
+        # so downstream handlers can drop the ongoing response.
+        shared_states = getattr(self.client_session_delegate, "shared_states", None)
+        if shared_states is not None and not shared_states.enable_vad:
+            if np.max(np.abs(array)) > 0.01:
+                shared_states.interrupting = True
+                shared_states.enable_vad = True
+                self.client_session_delegate.emit_signal(
+                    ChatSignal(
+                        type=ChatSignalType.INTERRUPT,
+                        source_type=ChatSignalSourceType.CLIENT,
+                        source_name="rtc",
+                    )
+                )
         self.client_session_delegate.put_data(
             EngineChannelType.AUDIO,
             array,
@@ -230,6 +244,14 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                         )
                     )
                 elif message['type'] == 'chat':
+                    # Interrupt ongoing avatar speech before starting a new query.
+                    self.client_session_delegate.emit_signal(
+                        ChatSignal(
+                            type=ChatSignalType.INTERRUPT,
+                            source_type=ChatSignalSourceType.CLIENT,
+                            source_name="rtc",
+                        )
+                    )
                     channel.send(json.dumps({'type': 'avatar_end'}))
                     if self.client_session_delegate.shared_states.enable_vad is False:
                         return

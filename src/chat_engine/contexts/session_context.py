@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from loguru import logger
 
@@ -13,6 +13,10 @@ from chat_engine.data_models.session_info_data import SessionInfoData, IOQueueTy
 class SharedStates:
     active: bool = False
     enable_vad: bool = True
+    # Whether the current response should be interrupted immediately.
+    interrupting: bool = False
+    # Track current avatar speech id to help downstream handlers drop stale frames.
+    current_speech_id: Optional[str] = None
 
 
 class SessionContext(object):

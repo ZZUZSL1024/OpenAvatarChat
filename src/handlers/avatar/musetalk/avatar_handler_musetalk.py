@@ -198,6 +198,15 @@ class HandlerAvatarMusetalk(HandlerBase):
         except Exception as e:
             logger.opt(exception=True).error(f"Failed to save debug record: {e}")
 
+    @staticmethod
+    def _clear_output_queues(context: AvatarMuseTalkContext):
+        for q in [context.audio_out_queue, context.video_out_queue, context.event_out_queue]:
+            try:
+                while not q.empty():
+                    q.get_nowait()
+            except Exception:
+                continue
+
     def get_handler_info(self) -> HandlerBaseInfo:
         """
         Return handler registration info.
@@ -391,6 +400,12 @@ class HandlerAvatarMusetalk(HandlerBase):
         if inputs.type != ChatDataType.AVATAR_AUDIO:
             return
         context = cast(AvatarMuseTalkContext, context)
+        if context.shared_state is not None and context.shared_state.interrupting:
+            if self.processor:
+                self.processor.interrupt()
+            self._clear_output_queues(context)
+            context.shared_state.interrupting = False
+            context.shared_state.enable_vad = True
         speech_id = inputs.data.get_meta("speech_id")
         speech_end = inputs.data.get_meta("avatar_speech_end", False)
         audio_entry = inputs.data.get_main_definition_entry()
