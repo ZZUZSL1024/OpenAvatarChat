@@ -390,5 +390,25 @@ class ChatSession:
 
     def emit_signal(self, signal: ChatSignal):
         # TODO this is temp implementation a full signal infrastructure is needed.
-        if signal.source_type == ChatSignalSourceType.CLIENT and signal.type == ChatSignalType.END:
-            self.session_context.shared_states.enable_vad = True
+        if signal.source_type == ChatSignalSourceType.CLIENT:
+            if signal.type == ChatSignalType.END:
+                self.session_context.shared_states.enable_vad = True
+            elif signal.type == ChatSignalType.INTERRUPT:
+                logger.info("Client interruption received, clearing queues and re-enabling VAD.")
+                self.session_context.shared_states.enable_vad = True
+
+                def _clear_queue(q: queue.Queue):
+                    try:
+                        while not q.empty():
+                            q.get_nowait()
+                    except Exception as e:
+                        logger.debug(f"Failed to clear queue: {e}")
+
+                for handler_record in self.handlers.values():
+                    if handler_record.env.input_queue is not None:
+                        _clear_queue(handler_record.env.input_queue)
+
+                for sinks in self.data_sinks.values():
+                    for sink in sinks:
+                        if sink.sink_queue is not None:
+                            _clear_queue(sink.sink_queue)

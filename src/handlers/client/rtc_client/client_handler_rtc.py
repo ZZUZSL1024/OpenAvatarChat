@@ -248,6 +248,7 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
         self.timestamp_generator = None
         self.data_submitter = None
         self.shared_states = None
+        self.signal_handler = None
         self.output_queues = {
             EngineChannelType.AUDIO: asyncio.Queue(),
             EngineChannelType.VIDEO: asyncio.Queue(),
@@ -308,7 +309,14 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
         return self.timestamp_generator()
 
     def emit_signal(self, signal: ChatSignal):
-        pass
+        if self.signal_handler is not None:
+            try:
+                self.signal_handler(signal)
+            except Exception as e:
+                logger.error(f"Failed to emit signal {signal}: {e}")
+
+    def set_signal_handler(self, handler):
+        self.signal_handler = handler
 
     def clear_data(self):
         for data_queue in self.output_queues.values():

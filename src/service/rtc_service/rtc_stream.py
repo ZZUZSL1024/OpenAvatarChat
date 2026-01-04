@@ -220,7 +220,7 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 if timestamp[0] / timestamp[1] < self.stream_start_delay:
                     return
                 logger.info(f'on_chat_datachannel: {message}')
-    
+
                 if message['type'] == 'stop_chat':
                     self.client_session_delegate.emit_signal(
                         ChatSignal(
@@ -230,6 +230,13 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                         )
                     )
                 elif message['type'] == 'chat':
+                    self.client_session_delegate.emit_signal(
+                        ChatSignal(
+                            type=ChatSignalType.INTERRUPT,
+                            source_type=ChatSignalSourceType.CLIENT,
+                            source_name="rtc",
+                        )
+                    )
                     channel.send(json.dumps({'type': 'avatar_end'}))
                     if self.client_session_delegate.shared_states.enable_vad is False:
                         return
