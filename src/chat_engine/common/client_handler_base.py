@@ -64,6 +64,10 @@ class ClientHandlerDelegate:
             msg = f"Client handler {handler_env.handler_info.handler_name} does not provide a session delegate."
             raise RuntimeError(msg)
         session_delegate = handler_env.handler_info.client_session_delegate_class()
+        if hasattr(session_delegate, "set_signal_handler"):
+            session_delegate.set_signal_handler(session.emit_signal)
+        elif hasattr(session_delegate, "signal_handler"):
+            session_delegate.signal_handler = session.emit_signal
         handler_env.handler.on_setup_session_delegate(session.session_context, handler_env.context, session_delegate)
         self.session_delegates[session_id] = session_delegate
         return session_delegate
