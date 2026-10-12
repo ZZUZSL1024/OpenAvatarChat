@@ -132,6 +132,7 @@ class HandlerLLM(HandlerBase, ABC):
         current_content = context.history.generate_next_messages(chat_text, 
                                                                  [context.current_image] if context.current_image is not None else [])
         logger.debug(f'llm input {context.model_name} {current_content} ')
+        completion = None
         try:
             completion = context.client.chat.completions.create(
                 model=context.model_name,  # 此处以qwen-plus为例，可按需更换模型名称。模型列表：https://help.aliyun.com/zh/model-studio/getting-started/models
@@ -162,12 +163,15 @@ class HandlerLLM(HandlerBase, ABC):
                 response = e.body
                 if isinstance(response, dict) and "message" in response:
                     response = f"{response['message']}"
-            output_text = response 
+            output_text = str(e) if not isinstance(e, APIStatusError) else str(response)
             output = DataBundle(output_definition)
             output.set_main_data(output_text)
             output.add_meta("avatar_text_end", False)
             output.add_meta("speech_id", speech_id)
             yield output
+        finally:
+            if completion is not None:
+                completion.close()
         context.input_texts = ''
         context.output_texts = ''
         logger.info('avatar text end')
@@ -176,6 +180,11 @@ class HandlerLLM(HandlerBase, ABC):
         end_output.add_meta("avatar_text_end", True)
         end_output.add_meta("speech_id", speech_id)
         yield end_output
+
+    def reset_generation(self, context: LLMContext, generation: int):
+        context.input_texts = ''
+        context.output_texts = ''
+        context.current_image = None
 
     def destroy_context(self, context: HandlerContext):
         pass

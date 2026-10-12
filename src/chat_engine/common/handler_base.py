@@ -85,5 +85,13 @@ class HandlerBase(ABC):
     def destroy_context(self, context: HandlerContext):
         pass
 
+    def on_interrupt(self, context: HandlerContext, generation: int):
+        """Invalidate asynchronous work immediately; do not block on network/GPU I/O."""
+        pass
+
+    def reset_generation(self, context: HandlerContext, generation: int):
+        """Reset buffered inputs on the handler thread before consuming a new epoch."""
+        pass
+
     def destroy(self):
         pass

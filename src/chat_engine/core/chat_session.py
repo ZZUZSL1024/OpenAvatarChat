@@ -12,7 +12,7 @@ from loguru import logger
 from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.common.engine_channel_type import EngineChannelType
 from chat_engine.common.handler_base import HandlerBase, HandlerBaseInfo, HandlerDataInfo, ChatDataConsumeMode
-from chat_engine.contexts.handler_context import HandlerContext, HandlerResultType
+from chat_engine.contexts.handler_context import HandlerContext, HandlerResultType, processing_generation
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel
@@ -60,33 +60,15 @@ class ChatDataSubmitter:
         self.sinks = sinks
         self.outputs = outputs
 
-    def submit(self, data: HandlerResultType):
+    def submit(self, data: HandlerResultType, generation=None):
         ChatSession.submit_data(
             data,
             self.handler_name,
             self.output_info,
             self.session_context,
             self.sinks,
-            self.outputs
-        )
-
-
-class ChatDataSubmitter:
-    def __init__(self, handler_name: str, output_info, session_context, sinks, outputs):
-        self.handler_name = handler_name
-        self.output_info = output_info
-        self.session_context = session_context
-        self.sinks = sinks
-        self.outputs = outputs
-
-    def submit(self, data: HandlerResultType):
-        ChatSession.submit_data(
-            data,
-            self.handler_name,
-            self.output_info,
-            self.session_context,
-            self.sinks,
-            self.outputs
+            self.outputs,
+            generation=generation,
         )
 
 
@@ -211,14 +193,15 @@ class ChatSession:
             for input_source in inputs:
                 input_queue = input_source.source_queue
                 try:
-                    input_data = input_queue.get_nowait()
-                    input_data_list.append((input_source, input_data))
+                    with shared_states.lock:
+                        input_data = input_queue.get_nowait()
+                        input_data_list.append((input_source, input_data, shared_states.generation))
                 except (queue.Empty, asyncio.QueueEmpty):
                     continue
             if len(input_data_list) == 0:
                 time.sleep(0.03)
                 continue
-            for input_source, input_data in input_data_list:
+            for input_source, input_data, generation in input_data_list:
                 for target_type in input_source.target_types:
                     chat_data = cls.packet_input_data(session_context, input_data, target_type)
                     if chat_data is None:
@@ -226,7 +209,10 @@ class ChatSession:
                     if not chat_data.is_timestamp_valid():
                         chat_data.timestamp = timestamp
                     chat_data.source = input_source.owner
-                    cls.distribute_data(chat_data, sinks, outputs)
+                    chat_data.generation = generation
+                    with shared_states.lock:
+                        if shared_states.is_current(generation):
+                            cls.distribute_data(chat_data, sinks, outputs)
 
     @classmethod
     def _packet_chat_data(cls, handler_name: str, output_info, session_context: SessionContext,
@@ -289,10 +275,25 @@ class ChatSession:
 
     @classmethod
     def submit_data(cls, data: HandlerResultType, handler_name: str, output_info, session_context: SessionContext,
-                    sinks: Dict[ChatDataType, List[DataSink]], outputs: Dict[Tuple[str, ChatDataType], DataSink]):
+                    sinks: Dict[ChatDataType, List[DataSink]], outputs: Dict[Tuple[str, ChatDataType], DataSink], generation=None):
         chat_data = cls._packet_chat_data(handler_name, output_info, session_context, data)
-        if chat_data is not None:
-            cls.distribute_data(chat_data, sinks, outputs)
+        if chat_data is None:
+            return
+        if generation is None:
+            generation = chat_data.generation
+        if generation is None:
+            generation = processing_generation.get()
+        # Background callbacks must retain their originating epoch. Never relabel
+        # an untagged callback as new work after an interruption.
+        if generation is None and not session_context.shared_states.interruption_enabled:
+            generation = session_context.shared_states.generation
+        if generation is None:
+            logger.warning("Dropping untagged asynchronous handler output: {}", handler_name)
+            return
+        chat_data.generation = generation
+        with session_context.shared_states.lock:
+            if session_context.shared_states.is_current(generation):
+                cls.distribute_data(chat_data, sinks, outputs)
 
     @classmethod
     def handler_pumper(cls, session_context: SessionContext, handler_env: HandlerEnv,
@@ -310,21 +311,39 @@ class ChatSession:
             except (queue.Empty, asyncio.QueueEmpty):
                 time.sleep(0.03)
                 continue
-            handler_result = handler.handle(handler_env.context, input_data, output_info)
-            if not isinstance(handler_result, Iterable):
-                handler_result = [handler_result]
-            for handler_output in handler_result:
-                if handler_result is None:
-                    continue
-                chat_data = cls._packet_chat_data(
-                    handler_env.handler_info.name,
-                    output_info,
-                    session_context,
-                    handler_output
-                )
-                if chat_data is None:
-                    continue
-                cls.distribute_data(chat_data, sinks, outputs)
+            generation = input_data.generation
+            if not shared_states.is_current(generation):
+                continue
+            context = handler_env.context
+            if getattr(context, "input_generation", None) != generation:
+                handler.reset_generation(context, generation)
+                context.input_generation = generation
+            token = processing_generation.set(generation)
+            handler_result = None
+            try:
+                handler_result = handler.handle(context, input_data, output_info)
+                results = (handler_result if isinstance(handler_result, Iterable)
+                           and not isinstance(handler_result, tuple) else [handler_result])
+                iterator = iter(results)
+                while shared_states.is_current(generation):
+                    try:
+                        handler_output = next(iterator)
+                    except StopIteration:
+                        break
+                    if not shared_states.is_current(generation):
+                        break
+                    cls.submit_data(handler_output, handler_env.handler_info.name,
+                                    output_info, session_context, sinks, outputs,
+                                    generation=generation)
+            except Exception:
+                logger.exception("Handler {} failed", handler_env.handler_info.name)
+                shared_states.set_vad(True, generation)
+            finally:
+                try:
+                    if hasattr(handler_result, "close"):
+                        handler_result.close()
+                finally:
+                    processing_generation.reset(token)
 
     def prepare_handler(self, handler: HandlerBase, handler_info: HandlerBaseInfo,
                         handler_config: HandlerBaseConfigModel):
@@ -372,6 +391,7 @@ class ChatSession:
         self.session_context.set_input_start()
 
     def stop(self):
+        self.emit_signal(ChatSignal(type=ChatSignalType.INTERRUPT, source_type=ChatSignalSourceType.CLIENT))
         self.session_context.shared_states.active = False
         if self.input_pump_thread:
             self.input_pump_thread.join()
@@ -389,6 +409,31 @@ class ChatSession:
         return self.session_context.get_timestamp()
 
     def emit_signal(self, signal: ChatSignal):
-        # TODO this is temp implementation a full signal infrastructure is needed.
-        if signal.source_type == ChatSignalSourceType.CLIENT and signal.type == ChatSignalType.END:
-            self.session_context.shared_states.enable_vad = True
+        if signal.source_type != ChatSignalSourceType.CLIENT:
+            return
+        states = self.session_context.shared_states
+        with states.lock:
+            if signal.type == ChatSignalType.END:
+                # Untagged/late END must not reopen VAD for a newer response.
+                states.set_vad(True, signal.generation if states.interruption_enabled else states.generation)
+            elif signal.type == ChatSignalType.INTERRUPT:
+                if not states.interruption_enabled:
+                    return
+                states.generation += 1
+                states.enable_vad = True
+                queues = list(self.session_context.input_queues.values())
+                queues += list(self.session_context.output_queues.values())
+                queues += [r.env.input_queue for r in self.handlers.values()]
+                queues += [s.sink_queue for sinks in self.data_sinks.values() for s in sinks]
+                queues += [s.sink_queue for s in self.outputs.values()]
+                for q in {id(q): q for q in queues if q is not None}.values():
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except (queue.Empty, asyncio.QueueEmpty):
+                            break
+                for record in self.handlers.values():
+                    try:
+                        record.env.handler.on_interrupt(record.env.context, states.generation)
+                    except Exception:
+                        logger.exception("Interrupt cleanup failed for {}", record.env.handler_info.name)

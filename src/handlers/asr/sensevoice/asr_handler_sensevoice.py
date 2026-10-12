@@ -148,7 +148,7 @@ class HandlerASR(HandlerBase, ABC):
         output_text = re.sub(r"<\|.*?\|>", "", res[0]['text'])
         if len(output_text) == 0:
             # 如果 ASR 识别结果为空，则需要重新开启vad
-            context.shared_states.enable_vad = True
+            context.shared_states.set_vad(True, inputs.generation)
             return
         output = DataBundle(output_definition)
         output.set_main_data(output_text)
@@ -161,6 +161,11 @@ class HandlerASR(HandlerBase, ABC):
         end_output.add_meta("human_text_end", True)
         end_output.add_meta("speech_id", speech_id)
         yield end_output
+
+    def reset_generation(self, context: ASRContext, generation: int):
+        context.output_audios.clear()
+        context.audio_slice_context.flush()
+        context.cache.clear()
 
     def destroy_context(self, context: HandlerContext):
         pass
