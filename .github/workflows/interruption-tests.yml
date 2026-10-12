@@ -1,0 +1,20 @@
+name: Interruption regression tests
+on:
+  pull_request:
+  push:
+    branches: [main, codex/integrate-realtime-interruption]
+permissions:
+  contents: read
+jobs:
+  cpu-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tests/interruption/requirements.txt
+      - run: python -m pip install -r tests/interruption/requirements.txt
+      - run: python -m pytest tests/interruption -q

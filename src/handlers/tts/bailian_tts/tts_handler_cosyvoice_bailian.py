@@ -1,5 +1,6 @@
 import io
 import os
+import threading
 import re
 import time
 from typing import Dict, Optional, cast
@@ -38,6 +39,8 @@ class TTSContext(HandlerContext):
         self.dump_audio = False
         self.audio_dump_file = None
         self.synthesizer = None
+        self.shared_states = None
+        self.active_speech_id = None
 
 
 class HandlerTTS(HandlerBase, ABC):
@@ -94,6 +97,7 @@ class HandlerTTS(HandlerBase, ABC):
             handler_config = TTSConfig()
         context = TTSContext(session_context.session_info.session_id)
         context.input_text = ''
+        context.shared_states = session_context.shared_states
         if context.dump_audio:
             dump_file_path = os.path.join(DirectoryInfo.get_project_dir(), 'temp',
                                           f"dump_avatar_audio_{context.session_id}_{time.localtime().tm_hour}_{time.localtime().tm_min}.pcm")
@@ -123,39 +127,81 @@ class HandlerTTS(HandlerBase, ABC):
         if text is not None:
             text = re.sub(r"<\|.*?\|>", "", text)
 
+        generation = inputs.generation
+        states = context.shared_states
         text_end = inputs.data.get_meta("avatar_text_end", False)
+        with states.lock:
+            if not states.is_current(generation):
+                return
+            if context.synthesizer is None:
+                callback = CosyvoiceCallBack(context, output_definition, speech_id, generation)
+                context.synthesizer = SpeechSynthesizer(
+                    model=self.model_name, voice=self.voice, callback=callback,
+                    format=AudioFormat.PCM_24000HZ_MONO_16BIT)
+                context.active_speech_id = speech_id
+            synthesizer = context.synthesizer
         try:
-            if not text_end:
-                if context.synthesizer is None:
-                    callback = CosyvoiceCallBack(
-                        context=context, output_definition=output_definition, speech_id=speech_id)
-                    context.synthesizer = SpeechSynthesizer(
-                        model=self.model_name, voice=self.voice, callback=callback, format=AudioFormat.PCM_24000HZ_MONO_16BIT)
-                logger.info(f'streaming_call {text}')
-                context.synthesizer.streaming_call(text)
-            else:
-                logger.info(f'streaming_call last {text}')
-                context.synthesizer.streaming_call(text)
-                context.synthesizer.streaming_complete()
-                context.synthesizer = None
-                context.input_text = ''
-        except Exception as e:
-            logger.error(e)
-            context.synthesizer.streaming_complete()
-            context.synthesizer = None
+            if not states.is_current(generation):
+                return
+            if text:
+                synthesizer.streaming_call(text)
+            if text_end and states.is_current(generation):
+                # Finishing normally may wait for the provider. Interrupt uses
+                # streaming_cancel instead and never waits on the RTC thread.
+                synthesizer.streaming_complete()
+                with states.lock:
+                    if context.synthesizer is synthesizer:
+                        context.synthesizer = None
+        except Exception:
+            logger.exception("CosyVoice stream failed")
+            self._cancel(synthesizer)
+            with states.lock:
+                if context.synthesizer is synthesizer:
+                    context.synthesizer = None
+                states.set_vad(True, generation)
+        finally:
+            if not states.is_current(generation):
+                self._cancel(synthesizer)
+
+    @staticmethod
+    def _cancel(synthesizer):
+        try:
+            synthesizer.streaming_cancel()
+        except Exception:
+            # A cancellation can race with the first streaming_call handshake.
+            # Close the transport as a fallback; callbacks are already invalid.
+            try:
+                synthesizer.close()
+            except Exception:
+                logger.exception("Failed to close cancelled CosyVoice stream")
+
+    def on_interrupt(self, context: TTSContext, generation: int):
+        synthesizer = context.synthesizer
+        context.synthesizer = None
+        context.active_speech_id = None
+        context.input_text = ''
+        if synthesizer is not None:
+            threading.Thread(target=self._cancel, args=(synthesizer,), daemon=True).start()
 
     def destroy_context(self, context: HandlerContext):
-        context = cast(TTSContext, context)
-        logger.info('destroy context')
+        with context.shared_states.lock:
+            self.on_interrupt(context, -1)
+        if context.audio_dump_file is not None:
+            context.audio_dump_file.close()
 
 
 class CosyvoiceCallBack(ResultCallback):
-    def __init__(self, context: TTSContext, output_definition, speech_id):
+    def __init__(self, context: TTSContext, output_definition, speech_id, generation):
         super().__init__()
         self.context = context
         self.output_definition = output_definition
         self.speech_id = speech_id
+        self.generation = generation
         self.temp_bytes = b''
+
+    def _should_drop(self):
+        return (not self.context.shared_states.is_current(self.generation)
+                or self.context.active_speech_id != self.speech_id)
 
     def on_open(self) -> None:
         logger.info('连接成功')
@@ -166,6 +212,9 @@ class CosyvoiceCallBack(ResultCallback):
         pass
 
     def on_data(self, data: bytes) -> None:
+        if self._should_drop():
+            self.temp_bytes = b''
+            return
         self.temp_bytes += data
         if len(self.temp_bytes) > 24000:
             # 实现接收合成二进制音频结果的逻辑
@@ -176,10 +225,13 @@ class CosyvoiceCallBack(ResultCallback):
             output.set_main_data(output_audio)
             output.add_meta("avatar_speech_end", False)
             output.add_meta("speech_id", self.speech_id)
-            self.context.submit_data(output)
+            self.context.submit_data(output, generation=self.generation)
             self.temp_bytes = b''
 
     def on_complete(self) -> None:
+        if self._should_drop():
+            self.temp_bytes = b''
+            return
         if len(self.temp_bytes) > 0:
             output_audio = np.array(np.frombuffer(self.temp_bytes, dtype=np.int16)).astype(np.float32)/32767
             output_audio = output_audio[np.newaxis, ...]
@@ -187,23 +239,26 @@ class CosyvoiceCallBack(ResultCallback):
             output.set_main_data(output_audio)
             output.add_meta("avatar_speech_end", False)
             output.add_meta("speech_id", self.speech_id)
-            self.context.submit_data(output)
+            self.context.submit_data(output, generation=self.generation)
             self.temp_bytes = b''
         output = DataBundle(self.output_definition)
         output.set_main_data(np.zeros(shape=(1, 240), dtype=np.float32))
         output.add_meta("avatar_speech_end", True)
         output.add_meta("speech_id", self.speech_id)
-        self.context.submit_data(output)
+        self.context.submit_data(output, generation=self.generation)
         logger.info(f"speech end")
         logger.info('合成完成')
 
     def on_error(self, message) -> None:
+        if self._should_drop():
+            self.temp_bytes = b''
+            return
         logger.error(f'bailian tts 服务出现异常,请确保参数正确：${message}')
         output = DataBundle(self.output_definition)
         output.set_main_data(np.zeros(shape=(1, 240), dtype=np.float32))
         output.add_meta("avatar_speech_end", True)
         output.add_meta("speech_id", self.speech_id)
-        self.context.submit_data(output)
+        self.context.submit_data(output, generation=self.generation)
         logger.info(f"speech end")
 
     def on_close(self) -> None:

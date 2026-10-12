@@ -246,7 +246,7 @@ class HandlerAudioVAD(HandlerBase, ABC):
             timestamp = extra_args.get("head_sample_id", head_sample_id)
             speech_id = f"speech-{context.session_id}-{context.speech_id}"
             if human_speech_end:
-                context.shared_states.enable_vad = False
+                context.shared_states.set_vad(False, inputs.generation)
                 context.reset()
             if audio_clip is not None:
                 output = DataBundle(output_definition)
@@ -261,6 +261,11 @@ class HandlerAudioVAD(HandlerBase, ABC):
                 if timestamp >= 0:
                     output_chat_data.timestamp = timestamp, sample_rate
                 yield output_chat_data
+
+    def reset_generation(self, context: HumanAudioVADContext, generation: int):
+        context.reset()
+        context.speaking_status = SpeakingStatus.END
+        context.model_state = np.zeros((2, 1, 128), dtype=np.float32)
 
     def destroy_context(self, context: HandlerContext):
         pass

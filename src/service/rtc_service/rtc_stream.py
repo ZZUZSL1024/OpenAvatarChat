@@ -36,6 +36,8 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                  output_frame_size=480,
                  fps=30,
                  stream_start_delay = 0.5,
+                 interrupt_threshold = 0.01,
+                 interrupt_duration = 0.096,
                  ):
         super().__init__(
             expected_layout=expected_layout,
@@ -52,6 +54,10 @@ class RtcStream(AsyncAudioVideoStreamHandler):
         self.session_id = session_id
         self.stream_start_delay = stream_start_delay
 
+        self.interrupt_threshold = interrupt_threshold
+        self.interrupt_duration = interrupt_duration
+        self._loud_samples = 0
+        self._voice_preroll = []
         self.chat_channel = None
         self.first_audio_emitted = False
 
@@ -87,6 +93,8 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 output_frame_size=self.output_frame_size,
                 fps=self.fps,
                 stream_start_delay=self.stream_start_delay,
+                interrupt_threshold=self.interrupt_threshold,
+                interrupt_duration=self.interrupt_duration,
             )
             new_stream.weak_factory = weakref.ref(self)
             new_session_delegate = self.client_handler_delegate.start_session(
@@ -109,7 +117,6 @@ class RtcStream(AsyncAudioVideoStreamHandler):
             # await self.wait_for_args()
 
             if not self.first_audio_emitted:
-                self.client_session_delegate.clear_data()
                 self.first_audio_emitted = True
 
             while not self.quit.is_set():
@@ -121,7 +128,10 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                     continue
                 sample_num = audio_array.shape[-1]
                 self.emit_counter.add_property("audio_emit", sample_num / self.output_sample_rate)
-                return self.output_sample_rate, audio_array
+                states = self.client_session_delegate.shared_states
+                with states.lock:
+                    if states.is_current(chat_data.generation):
+                        return self.output_sample_rate, audio_array
         except Exception as e:
             logger.opt(exception=e).error("Error in emit: ")
             raise
@@ -154,7 +164,10 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 if frame_data is None:
                     continue
                 
-                return frame_data
+                states = self.client_session_delegate.shared_states
+                with states.lock:
+                    if states.is_current(video_frame_data.generation):
+                        return frame_data
         except Exception as e:
             logger.opt(exception=e).error("Error in video_emit")
             raise
@@ -165,7 +178,32 @@ class RtcStream(AsyncAudioVideoStreamHandler):
         timestamp = self.client_session_delegate.get_timestamp()
         if timestamp[0] / timestamp[1] < self.stream_start_delay:
             return
-        _, array = frame
+        sample_rate, array = frame
+        states = self.client_session_delegate.shared_states
+        audio_queue = self.client_session_delegate.output_queues.get(EngineChannelType.AUDIO)
+        audio_pending = audio_queue is not None and not audio_queue.empty()
+        if states.interruption_enabled and (not states.enable_vad or audio_pending) and array.size:
+            # PCM may be int16 or normalized float. Convert before abs to avoid
+            # int16 overflow and measure sustained RMS rather than one spike.
+            normalized = array.astype(np.float32)
+            if np.issubdtype(array.dtype, np.integer):
+                normalized /= max(abs(np.iinfo(array.dtype).min), np.iinfo(array.dtype).max)
+            rms = float(np.sqrt(np.mean(normalized ** 2)))
+            if rms >= self.interrupt_threshold:
+                self._loud_samples += array.shape[-1]
+                self._voice_preroll.append((array.copy(), timestamp))
+                if self._loud_samples < sample_rate * self.interrupt_duration:
+                    return
+                self._interrupt()
+                # Keep the onset that triggered barge-in for ASR/VAD.
+                for buffered, buffered_timestamp in self._voice_preroll[:-1]:
+                    self.client_session_delegate.put_data(
+                        EngineChannelType.AUDIO, buffered, buffered_timestamp, sample_rate)
+            self._loud_samples = 0
+            self._voice_preroll.clear()
+        else:
+            self._loud_samples = 0
+            self._voice_preroll.clear()
         self.client_session_delegate.put_data(
             EngineChannelType.AUDIO,
             array,
@@ -201,57 +239,61 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                     current_role = 'human' if chat_data.type == ChatDataType.HUMAN_TEXT else 'avatar'
                     chat_id = uuid.uuid4().hex if current_role != role else chat_id
                     role = current_role
-                    self.chat_channel.send(json.dumps({'type': 'chat', 'message': chat_data.data.get_main_data(), 
-                                                        'id': chat_id, 'role': current_role}))  
+                    states = self.client_session_delegate.shared_states
+                    with states.lock:
+                        if states.is_current(chat_data.generation):
+                            self.chat_channel.send(json.dumps({
+                                'type': 'chat', 'message': chat_data.data.get_main_data(),
+                                'id': chat_id, 'role': current_role}))
             asyncio.create_task(process_chat_history())
                 
             @channel.on("message")
-            def _(message):
-                logger.info(f"Received message Custom: {message}")
-                try:
-                    message = json.loads(message)
-                except Exception as e:
-                    logger.info(e)
-                    message = {}
+            def on_message(message):
+                self.handle_message(message, channel)
 
-                if self.client_session_delegate is None:
-                    return
-                timestamp = self.client_session_delegate.get_timestamp()
-                if timestamp[0] / timestamp[1] < self.stream_start_delay:
-                    return
-                logger.info(f'on_chat_datachannel: {message}')
-    
-                if message['type'] == 'stop_chat':
-                    self.client_session_delegate.emit_signal(
-                        ChatSignal(
-                            type=ChatSignalType.INTERRUPT,
-                            source_type=ChatSignalSourceType.CLIENT,
-                            source_name="rtc",
-                        )
-                    )
-                elif message['type'] == 'chat':
-                    channel.send(json.dumps({'type': 'avatar_end'}))
-                    if self.client_session_delegate.shared_states.enable_vad is False:
-                        return
-                    self.client_session_delegate.shared_states.enable_vad = False
-                    self.client_session_delegate.emit_signal(
-                        ChatSignal(
-                            # begin a new round of responding
-                            type=ChatSignalType.BEGIN,
-                            stream_type=ChatDataType.AVATAR_AUDIO,
-                            source_type=ChatSignalSourceType.CLIENT,
-                            source_name="rtc",
-                        )
-                    )
-                    self.client_session_delegate.put_data(
-                        EngineChannelType.TEXT,
-                        message['data'],
-                        loopback=True
-                    )
-                # else:
+    def _interrupt(self):
+        if not self.client_session_delegate.shared_states.interruption_enabled:
+            return
+        self.client_session_delegate.emit_signal(ChatSignal(
+            type=ChatSignalType.INTERRUPT,
+            source_type=ChatSignalSourceType.CLIENT,
+            source_name="rtc",
+        ))
+        if self.chat_channel is not None:
+            self.chat_channel.send(json.dumps({'type': 'avatar_end'}))
 
-                # channel.send(json.dumps({"type": "chat", "unique_id": unique_id, "message": message}))
-          
+    def handle_message(self, raw_message, channel):
+        try:
+            message = json.loads(raw_message)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(message, dict) or self.client_session_delegate is None:
+            return
+        timestamp = self.client_session_delegate.get_timestamp()
+        if timestamp[1] <= 0 or timestamp[0] / timestamp[1] < self.stream_start_delay:
+            return
+        kind = message.get('type')
+        if kind == 'stop_chat':
+            self._interrupt()
+        elif kind == 'chat' and isinstance(message.get('data'), str) and message['data'].strip():
+            states = self.client_session_delegate.shared_states
+            if not states.interruption_enabled and not states.enable_vad:
+                return
+            self._interrupt()
+            if not states.interruption_enabled:
+                channel.send(json.dumps({'type': 'avatar_end'}))
+            self._loud_samples = 0
+            self._voice_preroll.clear()
+            self.client_session_delegate.shared_states.enable_vad = False
+            self.client_session_delegate.emit_signal(ChatSignal(
+                type=ChatSignalType.BEGIN,
+                stream_type=ChatDataType.AVATAR_AUDIO,
+                source_type=ChatSignalSourceType.CLIENT,
+                source_name="rtc",
+            ))
+            self.client_session_delegate.put_data(
+                EngineChannelType.TEXT, message['data'], loopback=True)
+
     async def on_chat_datachannel(self, message: Dict, channel):
         # {"type":"chat",id:"标识属于同一段话", "message":"Hello, world!"}
         # unique_id = uuid.uuid4().hex

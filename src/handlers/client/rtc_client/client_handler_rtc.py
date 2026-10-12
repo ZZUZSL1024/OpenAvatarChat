@@ -1,7 +1,5 @@
-import asyncio
 from pathlib import Path
-from typing import Dict, Optional, cast, Union, Tuple
-from uuid import uuid4
+from typing import Dict, Optional, cast
 
 from loguru import logger
 
@@ -9,7 +7,6 @@ from engine_utils.directory_info import DirectoryInfo
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import gradio
-import numpy as np
 from fastapi import FastAPI
 
 # ============================================================================
@@ -235,89 +232,21 @@ from chat_engine.contexts.session_context import SessionContext  # noqa: E402
 from chat_engine.data_models.chat_data.chat_data_model import ChatData  # noqa: E402
 from chat_engine.data_models.chat_data_type import ChatDataType  # noqa: E402
 from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel  # noqa: E402
-from chat_engine.data_models.chat_signal import ChatSignal  # noqa: E402
 from chat_engine.data_models.runtime_data.data_bundle import (  # noqa: E402
-    DataBundleDefinition, DataBundleEntry, VariableSize, DataBundle  # noqa: E402
+    DataBundleDefinition, DataBundleEntry, VariableSize  # noqa: E402
 )  # noqa: E402
 from service.rtc_service.rtc_provider import RTCProvider  # noqa: E402
 from service.rtc_service.rtc_stream import RtcStream  # noqa: E402
 
 
-class RtcClientSessionDelegate(ClientSessionDelegate):
-    def __init__(self):
-        self.timestamp_generator = None
-        self.data_submitter = None
-        self.shared_states = None
-        self.output_queues = {
-            EngineChannelType.AUDIO: asyncio.Queue(),
-            EngineChannelType.VIDEO: asyncio.Queue(),
-            EngineChannelType.TEXT: asyncio.Queue(),
-        }
-        self.input_data_definitions: Dict[EngineChannelType, DataBundleDefinition] = {}
-        self.modality_mapping = {
-            EngineChannelType.AUDIO: ChatDataType.MIC_AUDIO,
-            EngineChannelType.VIDEO: ChatDataType.CAMERA_VIDEO,
-            EngineChannelType.TEXT: ChatDataType.HUMAN_TEXT,
-        }
-
-    async def get_data(self, modality: EngineChannelType, timeout: Optional[float] = 0.1) -> Optional[ChatData]:
-        data_queue = self.output_queues.get(modality)
-        if data_queue is None:
-            return None
-        if timeout is not None and timeout > 0:
-            try:
-                data = await asyncio.wait_for(data_queue.get(), timeout)
-            except asyncio.TimeoutError:
-                return None
-        else:
-            data = await data_queue.get()
-        return data
-
-    def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
-                 timestamp: Optional[Tuple[int, int]] = None, samplerate: Optional[int] = None, loopback: bool = False):
-        if timestamp is None:
-            timestamp = self.get_timestamp()
-        if self.data_submitter is None:
-            return
-        definition = self.input_data_definitions.get(modality)
-        chat_data_type = self.modality_mapping.get(modality)
-        if chat_data_type is None or definition is None:
-            return
-        data_bundle = DataBundle(definition)
-        if modality == EngineChannelType.AUDIO:
-            data_bundle.set_main_data(data.squeeze()[np.newaxis, ...])
-        elif modality == EngineChannelType.VIDEO:
-            data_bundle.set_main_data(data[np.newaxis, ...])
-        elif modality == EngineChannelType.TEXT:
-            data_bundle.add_meta('human_text_end', True)
-            data_bundle.add_meta('speech_id', str(uuid4()))
-            data_bundle.set_main_data(data)
-        else:
-            return
-        chat_data = ChatData(
-            source="client",
-            type=chat_data_type,
-            data=data_bundle,
-            timestamp=timestamp,
-        )
-        self.data_submitter.submit(chat_data)
-        if loopback:
-            self.output_queues[modality].put_nowait(chat_data)
-
-    def get_timestamp(self):
-        return self.timestamp_generator()
-
-    def emit_signal(self, signal: ChatSignal):
-        pass
-
-    def clear_data(self):
-        for data_queue in self.output_queues.values():
-            while not data_queue.empty():
-                data_queue.get_nowait()
+from handlers.client.rtc_client.rtc_session_delegate import RtcClientSessionDelegate
 
 
 class ClientRtcConfigModel(HandlerBaseConfigModel, BaseModel):
     connection_ttl: int = Field(default=900)
+    enable_interruption: bool = Field(default=False)
+    interrupt_threshold: float = Field(default=0.01, gt=0, le=1)
+    interrupt_duration: float = Field(default=0.096, gt=0, le=2)
     turn_config: Optional[Dict] = Field(default=None)
 
 
@@ -352,6 +281,8 @@ class ClientHandlerRtc(ClientHandlerBase):
             output_frame_size=480,
             fps=30,
             stream_start_delay=0.5,
+            interrupt_threshold=self.handler_config.interrupt_threshold,
+            interrupt_duration=self.handler_config.interrupt_duration,
         )
         self.rtc_streamer_factory.client_handler_delegate = self.handler_delegate
 
@@ -439,6 +370,7 @@ class ClientHandlerRtc(ClientHandlerBase):
                        handler_config: Optional[HandlerBaseConfigModel] = None) -> HandlerContext:
         if not isinstance(handler_config, ClientRtcConfigModel):
             handler_config = ClientRtcConfigModel()
+        session_context.shared_states.interruption_enabled = handler_config.enable_interruption
         context = ClientRtcContext(session_context.session_info.session_id)
         context.config = handler_config
         return context
@@ -501,8 +433,14 @@ class ClientHandlerRtc(ClientHandlerBase):
         if context.client_session_delegate is None:
             return
         data_queue = context.client_session_delegate.output_queues.get(inputs.type.channel_type)
-        if data_queue is not None:
-            data_queue.put_nowait(inputs)
+        states = context.client_session_delegate.shared_states
+        with states.lock:
+            if data_queue is not None and states.is_current(inputs.generation):
+                data_queue.put_nowait(inputs)
+
+    def on_interrupt(self, context: HandlerContext, generation: int):
+        if context.client_session_delegate is not None:
+            context.client_session_delegate.clear_data()
 
     def destroy_context(self, context: HandlerContext):
-        pass
+        self.on_interrupt(context, -1)

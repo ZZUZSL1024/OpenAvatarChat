@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import os
 import time
 import pickle
-from typing import Dict, Optional, cast
+from typing import TYPE_CHECKING, Dict, Optional, cast
 import numpy as np
 from loguru import logger
 import threading
@@ -17,11 +19,15 @@ from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.runtime_data.data_bundle import DataBundleDefinition, DataBundleEntry, DataBundle, VariableSize
 from handlers.avatar.liteavatar.model.audio_input import SpeechAudio
-from handlers.avatar.liteavatar.liteavatar_worker import Tts2FaceEvent
+from handlers.avatar.liteavatar.model.tts2face_event import Tts2FaceEvent
 from handlers.avatar.musetalk.avatar_musetalk_processor import AvatarMuseTalkProcessor
-from handlers.avatar.musetalk.avatar_musetalk_algo import MuseAvatarV15
+
 from handlers.avatar.musetalk.avatar_musetalk_config import AvatarMuseTalkConfig
 from engine_utils.general_slicer import slice_data, SliceContext
+
+
+if TYPE_CHECKING:
+    from handlers.avatar.musetalk.avatar_musetalk_algo import MuseAvatarV15
 
 
 # Context class for MuseTalk avatar handler
@@ -65,7 +71,7 @@ class AvatarMuseTalkContext(HandlerContext):
         except Exception as e:
             logger.opt(exception=True).error(f"Failed to start event_out_thread: {e}")
 
-    def return_data(self, data: np.ndarray, chat_data_type: ChatDataType) -> None:
+    def return_data(self, data: np.ndarray, chat_data_type: ChatDataType, generation: int) -> None:
         """
         Package and submit output data for downstream consumption.
         Handles both audio and video data, ensuring correct format and type.
@@ -100,7 +106,7 @@ class AvatarMuseTalkContext(HandlerContext):
         else:
             return
         chat_data = ChatData(type=chat_data_type, data=data_bundle)
-        self.submit_data(chat_data)
+        self.submit_data(chat_data, generation=generation)
 
     def _media_out_loop(self) -> None:
         """
@@ -111,18 +117,18 @@ class AvatarMuseTalkContext(HandlerContext):
             no_output = True
             if self.audio_out_queue.qsize() > 0:
                 try:
-                    audio = self.audio_out_queue.get_nowait()
-                    self.return_data(audio, ChatDataType.AVATAR_AUDIO)
+                    generation, audio = self.audio_out_queue.get_nowait()
+                    self.return_data(audio, ChatDataType.AVATAR_AUDIO, generation)
                     no_output = False
                 except Exception as e:
                     logger.opt(exception=True).error(f"Exception when getting audio data: {e}")
             if self.video_out_queue.qsize() > 0:
                 try:
-                    video = self.video_out_queue.get_nowait()
+                    generation, video = self.video_out_queue.get_nowait()
                     if not isinstance(video, np.ndarray):
                         logger.error(f"video_out_queue got non-ndarray: {type(video)}, content: {str(video)[:100]}")
                         continue
-                    self.return_data(video, ChatDataType.AVATAR_VIDEO)
+                    self.return_data(video, ChatDataType.AVATAR_VIDEO, generation)
                     no_output = False
                 except Exception as e:
                     logger.opt(exception=True).error(f"Exception when getting video data: {e}")
@@ -138,10 +144,10 @@ class AvatarMuseTalkContext(HandlerContext):
         logger.info("Event out loop started")
         while self.loop_running:
             try:
-                event = self.event_out_queue.get(timeout=0.1)
+                generation, event = self.event_out_queue.get(timeout=0.1)
                 if isinstance(event, Tts2FaceEvent):
                     if event == Tts2FaceEvent.SPEAKING_TO_LISTENING:
-                        self.shared_state.enable_vad = True
+                        self.shared_state.set_vad(True, generation)
                         if self.config.debug:
                             logger.info("shared_state.enable_vad = True")
                 else:
@@ -175,15 +181,9 @@ class HandlerAvatarMusetalk(HandlerBase):
         Initialize MuseTalk avatar handler.
         """
         super().__init__()
-        self.processor: Optional[AvatarMuseTalkProcessor] = None
         self.avatar: Optional[MuseAvatarV15] = None
-        self.audio_input_thread = None
-        self.event_in_queue = queue.Queue()
-        self.event_out_queue = queue.Queue()
-        self.audio_out_queue = queue.Queue()
-        self.video_out_queue = queue.Queue()
+        self._inference_lock = threading.RLock()
         self.output_data_definitions: Dict[ChatDataType, DataBundleDefinition] = {}
-        self.shared_state = None
         self._debug_cache = {}
 
     def _save_debug_cache(self, speech_id: str, debug_root: str) -> None:
@@ -244,6 +244,8 @@ class HandlerAvatarMusetalk(HandlerBase):
         auto_avatar_id = f"avatar_{video_basename}_{video_hash}"
         logger.info(f"Auto generated avatar_id: {auto_avatar_id}")
         
+        from handlers.avatar.musetalk.avatar_musetalk_algo import MuseAvatarV15
+
         self.avatar = MuseAvatarV15(
             avatar_id=auto_avatar_id,
             video_path=handler_config.avatar_video_path,
@@ -266,12 +268,6 @@ class HandlerAvatarMusetalk(HandlerBase):
             gpu_id=0,
             debug=handler_config.debug
         )
-        self.processor = AvatarMuseTalkProcessor(
-            self.avatar,
-            handler_config
-        )
-        logger.info("HandlerAvatarMusetalk loaded and processor initialized.")
-
     def create_context(self, session_context: SessionContext,
                       handler_config: Optional[AvatarMuseTalkConfig] = None) -> HandlerContext:
         """
@@ -280,18 +276,16 @@ class HandlerAvatarMusetalk(HandlerBase):
         logger.info(f"HandlerAvatarMusetalk.create_context called, session_context={session_context}, handler_config={handler_config}")
         if not isinstance(handler_config, AvatarMuseTalkConfig):
             handler_config = AvatarMuseTalkConfig()
-        self.shared_state = session_context.shared_states
-        self.processor.audio_output_queue = self.audio_out_queue
-        self.processor.video_output_queue = self.video_out_queue
-        self.processor.event_out_queue = self.event_out_queue
         context = AvatarMuseTalkContext(
             session_context.session_info.session_id,
-            self.event_in_queue,
-            self.event_out_queue,
-            self.audio_out_queue,
-            self.video_out_queue,
-            self.shared_state
+            queue.Queue(), queue.Queue(), queue.Queue(), queue.Queue(),
+            session_context.shared_states,
         )
+        context.processor = AvatarMuseTalkProcessor(
+            self.avatar, handler_config, session_context.shared_states, self._inference_lock)
+        context.processor.audio_output_queue = context.audio_out_queue
+        context.processor.video_output_queue = context.video_out_queue
+        context.processor.event_out_queue = context.event_out_queue
         context.output_data_definitions = self.output_data_definitions
         context.config = handler_config
         
@@ -312,7 +306,7 @@ class HandlerAvatarMusetalk(HandlerBase):
         """
         Start context.
         """
-        self.processor.start()
+        handler_context.processor.start()
         logger.info("Context started and processor started.")
         if hasattr(handler_context, 'config') and getattr(handler_context.config, 'debug_replay_speech_id', None):
             speech_id = handler_context.config.debug_replay_speech_id
@@ -414,8 +408,7 @@ class HandlerAvatarMusetalk(HandlerBase):
                 audio_data=audio_segment.tobytes(),
                 sample_rate=input_sample_rate
             )
-            if self.processor:
-                self.processor.add_audio(speech_audio)
+            context.processor.add_audio(speech_audio, inputs.generation)
         if speech_end:
             # On speech end, flush remaining audio, fill with zeros if empty
             end_segment = context.input_slice_context.flush()
@@ -434,8 +427,7 @@ class HandlerAvatarMusetalk(HandlerBase):
                 audio_data=audio_data,
                 sample_rate=input_sample_rate
             )
-            if self.processor:
-                self.processor.add_audio(speech_audio)
+            context.processor.add_audio(speech_audio, inputs.generation)
 
     def _pack_debug_record(self, inputs: ChatData, output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         """
@@ -510,16 +502,16 @@ class HandlerAvatarMusetalk(HandlerBase):
             output_definitions = {chat_data.type: HandlerDataInfo(type=chat_data.type, definition=record["output_definition"])}
             self.handle(context, chat_data, output_definitions)
 
+    def on_interrupt(self, context: AvatarMuseTalkContext, generation: int):
+        context.processor.interrupt()
+
+    def reset_generation(self, context: AvatarMuseTalkContext, generation: int):
+        context.input_slice_context.flush()
+
     def destroy_context(self, context: HandlerContext):
         """
         Clean up and stop processor and related threads.
         """
         if isinstance(context, AvatarMuseTalkContext):
-            if self.processor:
-                self.processor.stop()
-            if self.audio_input_thread:
-                self.audio_input_thread.join()
-                self.audio_input_thread = None
+            context.processor.stop()
             context.clear()
-
-

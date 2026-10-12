@@ -1,4 +1,8 @@
 from typing import Tuple, Union
+from contextvars import ContextVar
+
+# Scoped to the handler invocation, never a mutable shared "current task".
+processing_generation = ContextVar("processing_generation", default=None)
 from loguru import logger
 import numpy as np
 
@@ -19,8 +23,8 @@ class HandlerContext(object):
         self.owner = None
         self.data_submitter = None
 
-    def submit_data(self, data: HandlerResultType):
+    def submit_data(self, data: HandlerResultType, generation=None):
         if self.data_submitter is None:
             logger.error("Session is not started, data submitter not ready.")
             return
-        self.data_submitter.submit(data)
+        self.data_submitter.submit(data, generation=generation)

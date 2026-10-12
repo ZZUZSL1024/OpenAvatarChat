@@ -1,5 +1,6 @@
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import RLock
 from typing import Dict, List, Tuple
 
 from loguru import logger
@@ -13,6 +14,18 @@ from chat_engine.data_models.session_info_data import SessionInfoData, IOQueueTy
 class SharedStates:
     active: bool = False
     enable_vad: bool = True
+    generation: int = 0
+    interruption_enabled: bool = False
+    lock: RLock = field(default_factory=RLock, repr=False)
+
+    def is_current(self, generation):
+        with self.lock:
+            return generation == self.generation
+
+    def set_vad(self, enabled, generation):
+        with self.lock:
+            if generation == self.generation:
+                self.enable_vad = enabled
 
 
 class SessionContext(object):

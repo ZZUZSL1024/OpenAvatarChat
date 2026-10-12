@@ -3,7 +3,6 @@ import torch.multiprocessing as mp
 import threading
 import time
 from typing import Optional
-from enum import Enum
 import os
 import numpy as np
 from multiprocessing import shared_memory
@@ -37,12 +36,7 @@ class Tts2FaceConfigModel(HandlerBaseConfigModel, BaseModel):
     stop_ack_timeout: float = Field(default=5.0)
 
 
-class Tts2FaceEvent(Enum):
-    START = 1001
-    STOP = 1002
-
-    LISTENING_TO_SPEAKING = 2001
-    SPEAKING_TO_LISTENING = 2002
+from handlers.avatar.liteavatar.model.tts2face_event import Tts2FaceEvent
 
 class Tts2FaceOutputHandler(AvatarOutputHandler):
     def __init__(self, audio_output_queue, video_output_queue,

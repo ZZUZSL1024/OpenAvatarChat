@@ -11,3 +11,4 @@ class ChatSignal(BaseModel):
     stream_type: Optional[ChatDataType] = Field(default=None)
     source_type: Optional[ChatSignalSourceType] = Field(default=None)
     source_name: str = Field(default="")
+    generation: Optional[int] = Field(default=None)

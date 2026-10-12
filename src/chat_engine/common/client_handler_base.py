@@ -18,6 +18,9 @@ from chat_engine.data_models.session_info_data import SessionInfoData
 
 
 class ClientSessionDelegate(ABC):
+    def set_signal_handler(self, handler):
+        self.signal_handler = handler
+
     @abstractmethod
     async def get_data(self, modality: EngineChannelType, timeout: Optional[float] = 0.1) -> Optional[ChatData]:
         pass
@@ -64,6 +67,7 @@ class ClientHandlerDelegate:
             msg = f"Client handler {handler_env.handler_info.handler_name} does not provide a session delegate."
             raise RuntimeError(msg)
         session_delegate = handler_env.handler_info.client_session_delegate_class()
+        session_delegate.set_signal_handler(session.emit_signal)
         handler_env.handler.on_setup_session_delegate(session.session_context, handler_env.context, session_delegate)
         self.session_delegates[session_id] = session_delegate
         return session_delegate

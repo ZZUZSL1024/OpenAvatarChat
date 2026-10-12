@@ -11,6 +11,7 @@ class ChatData:
     type: ChatDataType = ChatDataType.NONE
     timestamp: Tuple[int, int] = (0, 0)
     data: Optional[DataBundle] = None
+    generation: Optional[int] = None
 
     def is_timestamp_valid(self) -> bool:
         return self.timestamp[0] >= 0 and self.timestamp[1] > 0
